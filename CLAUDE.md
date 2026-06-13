@@ -19,9 +19,9 @@ user's whole body onto a Humanoid robot and drives intentional locomotion. See
 ### Tech Stack
 - **Language**: Python 3.12
 - **Package Manager**: uv (fast Python package manager)
-- **ML Framework**: PyTorch (GPU-enabled via CUDA 12.6) + Ultralytics YOLO11
+- **ML Framework**: MediaPipe Pose (3D landmarks, runs on CPU)
 - **Vision**: OpenCV
-- **Dependencies**: torch, torchvision, ultralytics, opencv-python, numpy
+- **Dependencies**: mediapipe, opencv-python, numpy
 
 ### Setup & Running
 
@@ -35,14 +35,14 @@ Run the application:
 uv run python main.py
 ```
 
-The first run auto-downloads the YOLO11n-pose model (~6 MB).
+The first run auto-downloads the MediaPipe Pose model.
 
 ### Customization
 
 Edit constants at the top of `main.py`:
-- `CONF_THRESHOLD` (0.5) - Person detection confidence
-- `KP_CONF_THRESHOLD` (0.5) - Keypoint confidence threshold
-- `MODEL_NAME` ("yolo11n-pose.pt") - Model selection (n/s/m/l variants available)
+- `KP_CONF_THRESHOLD` (0.5) - Keypoint confidence (MediaPipe visibility) threshold
+- `MODEL_VARIANT` ("full") - "lite" (fastest) / "full" (balanced) / "heavy" (most accurate)
+- `MIN_DET_CONF` / `MIN_PRESENCE_CONF` / `MIN_TRACK_CONF` (0.5) - Detection / presence / tracking confidence
 - `CAMERA_INDEX` (0) - Camera selection for multi-camera setups
 
 Tune locomotion gestures in `gesture_mapper.py` (e.g. `STEP_MIN_AMP`, `STEP_FULL_CROSS`
@@ -51,27 +51,36 @@ for forward sensitivity; `TURN_DEADZONE`, `TURN_SCALE` for turning; `JUMP_HOLD_F
 ### Architecture
 
 **main.py** is the entry point. Core flow:
-1. Loads YOLO11-pose model and detects device (CUDA if available, else CPU)
+1. Creates a MediaPipe Tasks PoseLandmarker (CPU; first run downloads the `.task` model)
 2. Opens camera and captures frames
-3. For each frame: runs inference → extracts 17 keypoints per person → draws skeleton visualization
-4. Selects the primary person, derives locomotion features, and streams a v2 UDP packet to Unity
-5. Displays FPS, person count, and device info on frame
+3. For each frame: runs inference → remaps MediaPipe's 33 landmarks to the 17
+   COCO keypoints (2D normalized + visibility + 3D world landmarks) → draws skeleton
+4. Derives locomotion features and streams a v3 UDP packet (2D + 3D) to Unity
+5. Displays FPS, detection state, and model info on frame
 6. Runtime controls: `q` quit, `p` print keypoints, `g` print locomotion features
 
 **Modules**:
-- `gesture_mapper.py` - `GestureMapper` converts keypoints into locomotion features:
-  `forward` (step-in-place cadence), `turn` (upper-body orientation), `jump` (both wrists raised)
-- `pose_sender.py` - `PoseSender` (UDP localhost:5005) + `build_packet()` (v2 schema:
-  flat normalized `kp[34]` + `kp_conf[17]` + features)
+- `gesture_mapper.py` - `GestureMapper` converts 2D keypoints (pixel coords) into
+  locomotion features: `forward` (step-in-place cadence), `turn` (upper-body
+  orientation), `jump` (both wrists raised). Unchanged by the 3D upgrade.
+- `pose_sender.py` - `PoseSender` (UDP localhost:5005) + `build_packet()` (v3 schema:
+  flat normalized `kp[34]` + `kp_conf[17]` + `kp3d[51]` + features)
 
 **Key Functions** (main.py):
+- `extract_coco()` - Remaps MediaPipe's 33 landmarks to the 17 COCO keypoints,
+  returning 2D normalized coords, visibility, and 3D world landmarks
 - `draw_pose()` - Renders green keypoint circles and orange skeleton lines
-- `select_primary()` - Picks the person with the largest keypoint bounding box
-- `print_pose_data()` - Outputs keypoint positions when `p` is pressed
+- `print_pose_data()` - Outputs 2D + 3D keypoint positions when `p` is pressed
+
+MediaPipe tracks a single person; the largest/most-confident body in frame is used
+(no multi-person selection needed).
 
 ### Detected Keypoints
 
-YOLO11-pose outputs 17 COCO-standard keypoints: nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles. See keypoint mapping and skeleton connectivity in main.py.
+The pipeline uses the 17 COCO-standard keypoints (nose, eyes, ears, shoulders,
+elbows, wrists, hips, knees, ankles) — a subset of MediaPipe's 33 landmarks, each
+now carrying a 3D (x, y, z) world position in addition to 2D. See `COCO_FROM_MP`
+mapping and skeleton connectivity in main.py.
 
 ---
 
@@ -119,9 +128,11 @@ YOLO11-pose outputs 17 COCO-standard keypoints: nose, eyes, ears, shoulders, elb
 - On start, enables pose mode (disables PlayerInput, locks camera, sets `PoseLocomotion`)
 
 **PoseAvatarDriver.cs** (`PoseControl`) - Full-body pose mirroring
-- In `LateUpdate` (after Animator), retargets the 2D keypoints onto Humanoid bones
-  (spine, neck, both arms and legs) via `Animator.GetBoneTransform` + `FromToRotation`
-- Planar (frontal-plane) avateering with confidence gating, Slerp smoothing, `mirror`/`swapSides`
+- In `LateUpdate` (after Animator), retargets the 3D world keypoints (`kp3d`) onto
+  Humanoid bones (spine, neck, both arms and legs) via `Animator.GetBoneTransform` +
+  `FromToRotation`; falls back to the 2D planar path when depth is unavailable
+- 3D avateering with confidence gating, Slerp smoothing, `mirror`/`swapSides`, and
+  `useDepth`/`depthScale` (flip `depthScale` sign if reach-toward-camera bends the wrong way)
 
 **MotionAudioController.cs** - Movement-triggered audio
 - Monitors character position changes
@@ -153,19 +164,21 @@ Open the project in Unity Editor 6000.4.7f1. Main scene is loaded via `LastScene
 
 Two-layer design sharing one UDP datagram (`127.0.0.1:5005`, JSON):
 
-- **Mirror layer** — full-body avateering. Raw 2D keypoints are retargeted onto the
-  Humanoid robot's bones (`PoseAvatarDriver`). 2D source, so it is a planar (frontal-plane)
-  approximation; most faithful when the user faces the camera.
+- **Mirror layer** — full-body avateering. The 3D world keypoints are retargeted onto the
+  Humanoid robot's bones (`PoseAvatarDriver`), so limbs can reach toward/away from the
+  camera, not just within the frontal plane. Falls back to the 2D planar path if depth
+  is unavailable. Most faithful when the user faces the camera.
 - **Locomotion layer** — intentional movement. `forward`/`turn`/`jump` drive root motion
   via `ThirdPersonController`'s pose mode (step-in-place = forward, body twist = turn).
 
-**Packet schema v2** (`pose_sender.build_packet`):
+**Packet schema v3** (`pose_sender.build_packet`):
 ```json
-{"v":2, "kp":[x0,y0,...x16,y16], "kp_conf":[...17], "forward":0..1, "turn":-1..1, "jump":bool, "confidence":0..1}
+{"v":3, "kp":[x0,y0,...x16,y16], "kp_conf":[...17], "kp3d":[x0,y0,z0,...x16,y16,z16], "forward":0..1, "turn":-1..1, "jump":bool, "confidence":0..1}
 ```
-`kp` is a flat float array (Unity `JsonUtility` cannot parse jagged arrays). When
-`confidence < 0.4` or packets stop for 0.5 s, locomotion zeroes out and the mirror holds
-its last good pose.
+All arrays are flat floats (Unity `JsonUtility` cannot parse jagged arrays). `kp` is
+2D normalized image coords; `kp3d` is metric, hip-centered 3D world landmarks (51 floats).
+When `confidence < 0.4` or packets stop for 0.5 s, locomotion zeroes out and the mirror
+holds its last good pose.
 
 **Avatar**: `Assets/Prefabs/PlayerRobot.prefab` → `Robot` GameObject (Humanoid rig,
 `TimmyRobot.fbx`, `animationType: 3`). The two `PoseControl` components are attached here
@@ -189,7 +202,7 @@ Keep the Python feature constants and Unity inspector fields in sync (e.g. `KP_M
 1. Activate environment: `uv sync`
 2. Run: `uv run python main.py`
 3. Test changes by modifying constants in main.py / gesture_mapper.py and re-running
-4. GPU requirement: NVIDIA GPU + CUDA 12.6 (CPU fallback supported)
+4. Runs on CPU (MediaPipe); no GPU/CUDA required. Raise `MODEL_COMPLEXITY` for accuracy.
 
 ### Unity (MothionCapture)
 1. Open project in Unity 6000.4.7f1

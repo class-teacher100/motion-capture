@@ -11,8 +11,9 @@ using StarterAssets;
 
 namespace PoseControl
 {
-    // Packet schema v2 (see pose_estimation/pose_sender.py).
-    // kp is a flat float[34] = [x0,y0, x1,y1, ... x16,y16] normalized 0..1.
+    // Packet schema v3 (see pose_estimation/pose_sender.py).
+    // kp    is a flat float[34] = [x0,y0, ... x16,y16] normalized 0..1 image coords.
+    // kp3d  is a flat float[51] = [x0,y0,z0, ... x16,y16,z16] metric, hip-centered.
     // JsonUtility supports float[] but not jagged arrays, hence the flat layout.
     [Serializable]
     struct PosePacket
@@ -20,6 +21,7 @@ namespace PoseControl
         public int v;
         public float[] kp;
         public float[] kp_conf;
+        public float[] kp3d;
         public float forward;
         public float turn;
         public bool jump;
@@ -43,6 +45,8 @@ namespace PoseControl
         // ── Shared with PoseAvatarDriver (read in its LateUpdate) ──────────────
         /// <summary>Flat normalized keypoints [x0,y0,...x16,y16], or null until first packet.</summary>
         public float[] LatestKp { get; private set; }
+        /// <summary>Flat 3D world keypoints [x0,y0,z0,...x16,y16,z16] in metres, or null.</summary>
+        public float[] LatestKp3D { get; private set; }
         /// <summary>Per-keypoint confidences (17), or null until first packet.</summary>
         public float[] LatestKpConf { get; private set; }
         /// <summary>True when the latest pose is fresh and confident enough to drive bones.</summary>
@@ -172,6 +176,7 @@ namespace PoseControl
             if (valid)
             {
                 LatestKp = p.kp;
+                LatestKp3D = p.kp3d;
                 LatestKpConf = p.kp_conf;
             }
             HasValidPose = valid;

@@ -1,10 +1,26 @@
-"""Real-time pose estimation using YOLO11-pose and OpenCV."""
+"""Real-time 3D pose estimation using the MediaPipe Tasks PoseLandmarker.
 
+PoseLandmarker outputs 33 landmarks with per-landmark depth (z), plus a
+hip-centered metric "world" landmark set. We extract the 17 COCO-standard
+keypoints (a subset of the 33) so the rest of the pipeline — locomotion
+features and the Unity 17-keypoint contract — stays unchanged, and we add a
+true 3D channel (kp3d) for full-body mirroring with depth.
+
+Uses the Tasks API (mp.tasks.vision) rather than the legacy mp.solutions,
+which is no longer shipped in recent mediapipe builds (e.g. on Python 3.14).
+The .task model is downloaded on first run.
+"""
+
+import os
 import time
+import urllib.request
+
 import cv2
 import numpy as np
-import torch
-from ultralytics import YOLO
+import mediapipe as mp
+from mediapipe.tasks import python as mp_tasks
+from mediapipe.tasks.python import vision as mp_vision
+
 from gesture_mapper import GestureMapper
 from pose_sender import PoseSender, build_packet
 
@@ -23,16 +39,62 @@ SKELETON = [
     (11, 13), (13, 15), (12, 14), (14, 16),    # legs
 ]
 
-CONF_THRESHOLD = 0.5
-KP_CONF_THRESHOLD = 0.5
-MODEL_NAME = "yolo11n-pose.pt"
+# COCO keypoint index -> MediaPipe Pose landmark index.
+# MediaPipe's 33 landmarks include every COCO joint, so this is a pure remap.
+COCO_FROM_MP = [0, 2, 5, 7, 8, 11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28]
+
+KP_CONF_THRESHOLD = 0.5     # MediaPipe "visibility" treated as keypoint confidence
+MIN_DET_CONF = 0.5
+MIN_PRESENCE_CONF = 0.5
+MIN_TRACK_CONF = 0.5
 CAMERA_INDEX = 0
+FRAME_W, FRAME_H = 1280, 720
+
+# Model variant: "lite" (fastest) | "full" (balanced) | "heavy" (most accurate).
+MODEL_VARIANT = "full"
+MODEL_PATH = f"pose_landmarker_{MODEL_VARIANT}.task"
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+    f"pose_landmarker_{MODEL_VARIANT}/float16/latest/"
+    f"pose_landmarker_{MODEL_VARIANT}.task"
+)
 
 
-def draw_pose(frame: cv2.Mat, keypoints, confidences) -> None:
+def ensure_model() -> str:
+    """Download the PoseLandmarker .task model on first run; return its path."""
+    if not os.path.exists(MODEL_PATH):
+        print(f"Downloading {MODEL_PATH} ...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print("Model downloaded.")
+    return MODEL_PATH
+
+
+def extract_coco(image_landmarks, world_landmarks):
+    """Remap MediaPipe's 33 landmarks to the 17 COCO keypoints.
+
+    Returns:
+        kp_norm   (17, 2) normalized 0..1 image coords
+        kp_conf   (17,)   visibility per keypoint
+        kp_world  (17, 3) metric, hip-centered 3D coords
+    """
+    kp_norm = np.zeros((17, 2), dtype=float)
+    kp_conf = np.zeros(17, dtype=float)
+    kp_world = np.zeros((17, 3), dtype=float)
+
+    for coco_i, mp_i in enumerate(COCO_FROM_MP):
+        lm = image_landmarks[mp_i]
+        kp_norm[coco_i] = (lm.x, lm.y)
+        kp_conf[coco_i] = lm.visibility
+        wl = world_landmarks[mp_i]
+        kp_world[coco_i] = (wl.x, wl.y, wl.z)
+
+    return kp_norm, kp_conf, kp_world
+
+
+def draw_pose(frame: cv2.Mat, kp_px, confidences) -> None:
     h, w = frame.shape[:2]
     points = {}
-    for i, (kp, conf) in enumerate(zip(keypoints, confidences)):
+    for i, (kp, conf) in enumerate(zip(kp_px, confidences)):
         if conf < KP_CONF_THRESHOLD:
             continue
         x, y = int(kp[0]), int(kp[1])
@@ -46,51 +108,41 @@ def draw_pose(frame: cv2.Mat, keypoints, confidences) -> None:
             cv2.line(frame, points[a], points[b], (0, 200, 255), 2)
 
 
-def select_primary(kps_xy, kps_conf, min_conf: float = 0.4) -> int:
-    """Return index of person with the largest valid-keypoint bounding box."""
-    best, best_area = 0, -1.0
-    for i, (kps, confs) in enumerate(zip(kps_xy, kps_conf)):
-        valid = kps[confs >= min_conf]
-        if len(valid) < 2:
-            continue
-        area = float(
-            (valid[:, 0].max() - valid[:, 0].min()) *
-            (valid[:, 1].max() - valid[:, 1].min())
-        )
-        if area > best_area:
-            best_area, best = area, i
-    return best
-
-
-def print_pose_data(person_idx: int, keypoints, confidences) -> None:
-    print(f"\n--- Person {person_idx + 1} ---")
-    for i, (kp, conf) in enumerate(zip(keypoints, confidences)):
+def print_pose_data(kp_px, kp_world, confidences) -> None:
+    print("\n--- Pose ---")
+    for i, (kp, w3, conf) in enumerate(zip(kp_px, kp_world, confidences)):
         if conf >= KP_CONF_THRESHOLD:
-            print(f"  {KEYPOINT_NAMES[i]:>16}: ({kp[0]:6.1f}, {kp[1]:6.1f})  conf={conf:.2f}")
+            print(f"  {KEYPOINT_NAMES[i]:>16}: px=({kp[0]:6.1f}, {kp[1]:6.1f})  "
+                  f"3d=({w3[0]:+.2f}, {w3[1]:+.2f}, {w3[2]:+.2f})  vis={conf:.2f}")
 
 
 def main() -> None:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    if device == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-
-    model = YOLO(MODEL_NAME)
-    model.to(device)
-
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera index {CAMERA_INDEX}")
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
 
+    model_path = ensure_model()
+    print(f"MediaPipe PoseLandmarker ({MODEL_VARIANT}) ready.")
     print("\nControls: [q] quit  [p] print keypoints  [g] print locomotion features\n")
+
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=mp_tasks.BaseOptions(model_asset_path=model_path),
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=MIN_DET_CONF,
+        min_pose_presence_confidence=MIN_PRESENCE_CONF,
+        min_tracking_confidence=MIN_TRACK_CONF,
+    )
+    landmarker = mp_vision.PoseLandmarker.create_from_options(options)
 
     mapper = GestureMapper()
     sender = PoseSender()
 
     prev_time = time.perf_counter()
+    last_ts_ms = -1
     print_next = False
     print_gesture = False
 
@@ -99,30 +151,36 @@ def main() -> None:
         if not ret:
             break
 
-        results = model(frame, conf=CONF_THRESHOLD, verbose=False)
-        result = results[0]
+        # MediaPipe expects an RGB mp.Image; OpenCV gives BGR.
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        if result.keypoints is not None and len(result.keypoints) > 0:
-            kps_xy = result.keypoints.xy.cpu().numpy()      # (N, 17, 2)
-            kps_conf = result.keypoints.conf.cpu().numpy()  # (N, 17)
+        # VIDEO mode needs a strictly increasing timestamp in ms.
+        ts_ms = max(last_ts_ms + 1, int(time.perf_counter() * 1000))
+        last_ts_ms = ts_ms
+        result = landmarker.detect_for_video(mp_image, ts_ms)
 
-            for i, (keypoints, confidences) in enumerate(zip(kps_xy, kps_conf)):
-                draw_pose(frame, keypoints, confidences)
-                if print_next:
-                    print_pose_data(i, keypoints, confidences)
+        h, w = frame.shape[:2]
+        detected = bool(result.pose_landmarks) and bool(result.pose_world_landmarks)
 
-            primary = select_primary(kps_xy, kps_conf)
-            features = mapper.compute(kps_xy[primary], kps_conf[primary])
+        if detected:
+            kp_norm, kp_conf, kp_world = extract_coco(
+                result.pose_landmarks[0],
+                result.pose_world_landmarks[0],
+            )
 
-            # Normalize keypoints to 0..1 for full-body mirroring Unity-side.
-            h, w = frame.shape[:2]
-            kp_norm = kps_xy[primary].astype(float).copy()
-            kp_norm[:, 0] /= w
-            kp_norm[:, 1] /= h
+            kp_px = kp_norm.copy()
+            kp_px[:, 0] *= w
+            kp_px[:, 1] *= h
 
-            sender.send(build_packet(kp_norm, kps_conf[primary], features))
+            draw_pose(frame, kp_px, kp_conf)
+            if print_next:
+                print_pose_data(kp_px, kp_world, kp_conf)
+
+            features = mapper.compute(kp_px, kp_conf)
+            sender.send(build_packet(kp_norm, kp_conf, kp_world, features))
             if print_gesture:
-                print(f"Features (person {primary + 1}): {features}")
+                print(f"Features: {features}")
         else:
             sender.send_neutral()
             mapper.reset()
@@ -134,15 +192,14 @@ def main() -> None:
         fps = 1.0 / (now - prev_time)
         prev_time = now
 
-        n_persons = len(result.keypoints) if result.keypoints is not None else 0
         cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        cv2.putText(frame, f"Persons: {n_persons}", (10, 65),
+        cv2.putText(frame, f"Detected: {'yes' if detected else 'no'}", (10, 65),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        cv2.putText(frame, f"Device: {device.upper()}", (10, 100),
+        cv2.putText(frame, f"MediaPipe 3D ({MODEL_VARIANT})", (10, 100),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
 
-        cv2.imshow("Pose Estimation (YOLO11)", frame)
+        cv2.imshow("Pose Estimation (MediaPipe 3D)", frame)
 
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
@@ -154,6 +211,7 @@ def main() -> None:
 
     cap.release()
     cv2.destroyAllWindows()
+    landmarker.close()
     sender.close()
 
 

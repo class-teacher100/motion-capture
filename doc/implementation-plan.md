@@ -1,9 +1,17 @@
 # 実装計画：ポーズ推定 → Unity ロボット 全身ミラー＋意図的ロコモーション
 
+> **更新（v3 / 3D 化）**: 推論を YOLO11（2D）から **MediaPipe Pose（3D）** に変更。
+> パケットは v3 になり、従来の 2D `kp`/`kp_conf` に加えて 3D ワールド座標 `kp3d[51]`
+> （メートル・腰中心）を送信する。`PoseAvatarDriver` は `kp3d` で奥行きを含む真の 3D
+> ボーン方向を計算し（`useDepth`/`depthScale`）、`kp3d` が無い場合は従来の 2D 平面パス
+> にフォールバックする。`gesture_mapper.py` は 2D のままで変更なし。以下の本文中の
+> 「YOLO11」「v2」「2D 平面」等の記述はこの上書きを反映した読み替えが必要。
+
 ## 概要
 
-`pose_estimation`（Python/YOLO11）で取得した人体姿勢データをリアルタイムに
-`MothionCapture`（Unity）へ送信し、カメラの前での全身の動きで 3D ロボットを操作する。
+`pose_estimation`（Python/MediaPipe Pose）で取得した人体姿勢データ（2D＋3D）を
+リアルタイムに `MothionCapture`（Unity）へ送信し、カメラの前での全身の動きで
+3D ロボットを操作する。
 
 設計は**二層構成**:
 
@@ -274,6 +282,11 @@ v2 パケット（flat kp）化、`PoseAvatarDriver.cs` による 2D→ボーン
 
 ### Phase 4: ロコモーション統合 ✅ 完了
 `ThirdPersonController` ポーズ移動モード（足踏み前進＋向き旋回、歩行アニメ非再生）。
+
+### Phase 5: 3D 化（MediaPipe） ✅ 完了
+推論を MediaPipe Pose に置換、v3 パケットで `kp3d`（3D ワールド座標）を追加送信。
+`PoseAvatarDriver.cs` を 3D ボーン方向（`useDepth`/`depthScale`、2D フォールバック付き）
+に拡張し、奥行き方向の動きをミラー可能にした。
 
 ### Phase 5: 調整・運用（任意）
 - `mirror`/`swapSides`/`responsiveness`/`TurnSpeed` と Python 側定数の実機調整

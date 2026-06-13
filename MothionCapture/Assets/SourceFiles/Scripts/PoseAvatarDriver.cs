@@ -4,14 +4,16 @@ using UnityEngine;
 namespace PoseControl
 {
     /// <summary>
-    /// Full-body pose mirroring: retargets the 2D YOLO keypoints received by
+    /// Full-body pose mirroring: retargets the MediaPipe keypoints received by
     /// <see cref="PoseInputReceiver"/> onto the Humanoid avatar's bones.
     ///
-    /// 2D-only source (no depth), so bones are oriented within the character's
-    /// frontal plane (planar avateering). Rotations are applied in LateUpdate,
-    /// after the Animator has evaluated the base pose, so the mirror always wins.
-    /// Locomotion (root translation + turn + jump) is handled separately by
-    /// ThirdPersonController; this component only orients limbs/torso/head.
+    /// Prefers the 3D world keypoints (kp3d, schema v3) so bones are oriented in
+    /// full 3D — limbs can reach toward/away from the camera, not just within the
+    /// frontal plane. Falls back to the 2D planar path when depth is unavailable.
+    /// Rotations are applied in LateUpdate, after the Animator has evaluated the
+    /// base pose, so the mirror always wins. Locomotion (root translation + turn
+    /// + jump) is handled separately by ThirdPersonController; this component only
+    /// orients limbs/torso/head.
     /// </summary>
     [DefaultExecutionOrder(200)]
     public class PoseAvatarDriver : MonoBehaviour
@@ -31,6 +33,12 @@ namespace PoseControl
         [Range(0f, 1f)] public float kpMinConf = 0.4f;
         [Tooltip("Higher = snappier limb tracking, lower = smoother/laggier.")]
         public float responsiveness = 15.0f;
+
+        [Header("Depth (3D)")]
+        [Tooltip("Use the 3D world keypoints (kp3d) for true depth. Off = planar 2D fallback.")]
+        public bool useDepth = true;
+        [Tooltip("Sign/scale for the depth axis. Flip the sign if reaching toward the camera bends limbs the wrong way.")]
+        public float depthScale = -1.0f;
 
         // COCO keypoint indices
         const int NOSE = 0;
@@ -97,10 +105,11 @@ namespace PoseControl
             if (receiver == null) return;
 
             float[] kp = receiver.LatestKp;
+            float[] kp3d = receiver.LatestKp3D;
             float[] conf = receiver.LatestKpConf;
-            bool fresh = receiver.HasValidPose
-                         && kp != null && kp.Length >= N_KP * 2
-                         && conf != null && conf.Length >= N_KP;
+            bool confOk = receiver.HasValidPose && conf != null && conf.Length >= N_KP;
+            bool has3d = confOk && useDepth && kp3d != null && kp3d.Length >= N_KP * 3;
+            bool has2d = confOk && kp != null && kp.Length >= N_KP * 2;
 
             float t = 1f - Mathf.Exp(-responsiveness * Time.deltaTime);  // framerate-independent slerp
 
@@ -108,24 +117,75 @@ namespace PoseControl
             {
                 RuntimeBone rb = _bones[i];
 
-                if (fresh &&
+                bool gotTarget = false;
+                Vector3 tgt = Vector3.zero;
+
+                // Prefer the true 3D direction; fall back to the planar 2D one.
+                if (has3d &&
+                    TryPoint3D(kp3d, conf, rb.a, out Vector3 a3) &&
+                    TryPoint3D(kp3d, conf, rb.b, out Vector3 b3))
+                {
+                    tgt = ToWorldDir3D(b3 - a3);
+                    gotTarget = true;
+                }
+                else if (has2d &&
                     TryPoint(kp, conf, rb.a, out Vector2 pa) &&
                     TryPoint(kp, conf, rb.b, out Vector2 pb))
                 {
+                    tgt = ToWorldDir(pb - pa);
+                    gotTarget = true;
+                }
+
+                if (gotTarget && IsFinite(tgt))
+                {
                     Vector3 cur = rb.child.position - rb.bone.position;
-                    Vector3 tgt = ToWorldDir(pb - pa);
                     if (cur.sqrMagnitude > 1e-8f && tgt.sqrMagnitude > 1e-8f)
                     {
                         Quaternion desired = Quaternion.FromToRotation(cur, tgt) * rb.bone.rotation;
-                        _smoothed[i] = _hasSmoothed[i] ? Quaternion.Slerp(_smoothed[i], desired, t) : desired;
-                        _hasSmoothed[i] = true;
+                        if (IsFinite(desired))
+                        {
+                            _smoothed[i] = _hasSmoothed[i] ? Quaternion.Slerp(_smoothed[i], desired, t) : desired;
+                            _hasSmoothed[i] = true;
+                        }
                     }
                 }
 
                 // Apply the held rotation (last good pose) whenever we have one.
-                if (_hasSmoothed[i])
+                // Guard against NaN/Inf so a single bad value can't blow up the whole rig.
+                if (_hasSmoothed[i] && IsFinite(_smoothed[i]))
                     rb.bone.rotation = _smoothed[i];
             }
+        }
+
+        private static bool IsFinite(Vector3 v) =>
+            !(float.IsNaN(v.x) || float.IsNaN(v.y) || float.IsNaN(v.z) ||
+              float.IsInfinity(v.x) || float.IsInfinity(v.y) || float.IsInfinity(v.z));
+
+        private static bool IsFinite(Quaternion q) =>
+            !(float.IsNaN(q.x) || float.IsNaN(q.y) || float.IsNaN(q.z) || float.IsNaN(q.w) ||
+              float.IsInfinity(q.x) || float.IsInfinity(q.y) || float.IsInfinity(q.z) || float.IsInfinity(q.w));
+
+        /// <summary>Average the given keypoints into a 3D world point; false if any is low-confidence.</summary>
+        private bool TryPoint3D(float[] kp3d, float[] conf, int[] idx, out Vector3 p)
+        {
+            Vector3 sum = Vector3.zero;
+            for (int k = 0; k < idx.Length; k++)
+            {
+                int i = swapSides ? SwapSide(idx[k]) : idx[k];
+                if (conf[i] < kpMinConf) { p = Vector3.zero; return false; }
+                sum += new Vector3(kp3d[i * 3], kp3d[i * 3 + 1], kp3d[i * 3 + 2]);
+            }
+            p = sum / idx.Length;
+            return true;
+        }
+
+        /// <summary>Map a 3D world delta (x right, y down, z depth) into the character's local axes.</summary>
+        private Vector3 ToWorldDir3D(Vector3 d)
+        {
+            float x = mirror ? -d.x : d.x;
+            return transform.right * x
+                 + transform.up * (-d.y)
+                 + transform.forward * (d.z * depthScale);
         }
 
         /// <summary>Average the given keypoints into a normalized image point; false if any is low-confidence.</summary>
