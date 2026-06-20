@@ -1,0 +1,10 @@
+[project]
+name = "fight2d"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "pygame>=2.5.0",
+    "mediapipe>=0.10.14",
+    "opencv-python>=4.10.0",
+    "numpy>=1.26.0",
+]
