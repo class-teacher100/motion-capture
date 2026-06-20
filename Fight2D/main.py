@@ -198,6 +198,7 @@ class CpuAI:
 def make_fighters():
     player = Fighter(PLAYER_SPAWN_X, GROUND_Y, is_player=True)
     cpu    = Fighter(CPU_SPAWN_X,    GROUND_Y, is_player=False)
+    cpu.damage_mult = 0.1
     return player, cpu
 
 

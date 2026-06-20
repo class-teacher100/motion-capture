@@ -54,6 +54,7 @@ class Fighter:
         self.state_timer    = 0
         self.punch_cooldown = 0
         self.kick_cooldown  = 0
+        self.damage_mult    = 1.0     # scale outgoing attack damage
         self._hit_dealt     = False   # prevent double-hit per swing
 
     # ───────────────────────────────────────────── geometry ──────────────────
@@ -139,7 +140,7 @@ class Fighter:
         if atk and not self._hit_dealt:
             if atk.colliderect(opponent.body_rect()):
                 dmg = PUNCH_DAMAGE if self.state == "punch" else KICK_DAMAGE
-                opponent.take_hit(dmg)
+                opponent.take_hit(max(1, int(dmg * self.damage_mult)))
                 self._hit_dealt = True
 
         # Cooldowns
