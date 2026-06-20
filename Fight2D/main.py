@@ -111,19 +111,87 @@ def frame_to_surface(bgr_frame) -> pygame.Surface:
 
 
 # ── CPU AI ────────────────────────────────────────────────────────────────────
-def run_cpu_ai(cpu: Fighter, player: Fighter) -> str | None:
-    if cpu.state in ("punch", "kick", "hurt", "dead", "jump"):
-        return None
-    dist = abs(cpu.x - player.x)
-    if cpu.is_grounded() and random.random() < 0.003:
-        return "jump"
-    if dist <= 80 and cpu.kick_cooldown == 0:
-        return "kick_L" if player.x < cpu.x else "kick_R"
-    if dist <= 130 and cpu.punch_cooldown == 0:
-        return "punch_L" if player.x < cpu.x else "punch_R"
-    if dist > 120:
-        return "move_L" if player.x > cpu.x else "move_R"
-    return None
+class CpuAI:
+    """
+    短周期で近づいたり離れたりしながら、長周期で一定の間合いを保つ AI。
+
+    モード状態機械 (approach / retreat / neutral) を短周期(20〜50f)で切り替える。
+    現在の間合いが PREFERRED_DIST からずれると次モードの重みが補正されるため、
+    長周期では自然にその距離に収束する。
+    """
+    PREFERRED_DIST  = 130   # 理想の間合い (px)
+    ATTACK_DIST_KICK  = 85
+    ATTACK_DIST_PUNCH = 135
+    JUMP_PROB = 0.003       # 毎フレームのジャンプ確率
+
+    # 各モードの継続フレーム範囲
+    _DUR = {
+        "approach": (20, 45),
+        "retreat":  (15, 35),
+        "neutral":  (10, 25),
+    }
+
+    def __init__(self) -> None:
+        self._mode  = "neutral"
+        self._timer = 20
+
+    def reset(self) -> None:
+        self.__init__()
+
+    def tick(self, cpu: Fighter, player: Fighter) -> str | None:
+        """毎フレーム呼び出してアクション文字列を返す。"""
+        if cpu.state in ("punch", "kick", "hurt", "dead", "jump"):
+            return None
+
+        dist = abs(cpu.x - player.x)
+
+        # ── 攻撃判定 (間合い優先) ─────────────────────────────────────────
+        if dist <= self.ATTACK_DIST_KICK and cpu.kick_cooldown == 0:
+            return "kick_L" if player.x < cpu.x else "kick_R"
+        if dist <= self.ATTACK_DIST_PUNCH and cpu.punch_cooldown == 0:
+            return "punch_L" if player.x < cpu.x else "punch_R"
+
+        # ── ジャンプ (低確率) ─────────────────────────────────────────────
+        if cpu.is_grounded() and random.random() < self.JUMP_PROB:
+            return "jump"
+
+        # ── モード更新 ────────────────────────────────────────────────────
+        self._timer -= 1
+        if self._timer <= 0:
+            self._mode  = self._next_mode(dist)
+            lo, hi      = self._DUR[self._mode]
+            self._timer = random.randint(lo, hi)
+
+        # ── 移動アクション生成 ───────────────────────────────────────────
+        toward = "move_L" if player.x < cpu.x else "move_R"
+        away   = "move_R" if player.x < cpu.x else "move_L"
+
+        if self._mode == "approach":
+            # 近づきすぎたら止まる (衝突回避)
+            return toward if dist > 55 else None
+        if self._mode == "retreat":
+            return away
+        return None   # neutral
+
+    def _next_mode(self, dist: float) -> str:
+        """間合いに応じた重みでモードをランダム選択。"""
+        ratio = dist / self.PREFERRED_DIST
+        if ratio < 0.6:
+            # 近すぎ → 退く傾向
+            weights = [0.10, 0.65, 0.25]
+        elif ratio < 0.85:
+            # やや近い → 少し退く
+            weights = [0.25, 0.50, 0.25]
+        elif ratio < 1.20:
+            # 理想の間合い → バランスよく出入り (ダンス)
+            weights = [0.40, 0.40, 0.20]
+        elif ratio < 1.60:
+            # やや遠い → 近づく傾向
+            weights = [0.55, 0.20, 0.25]
+        else:
+            # 遠すぎ → 積極的に近づく
+            weights = [0.75, 0.05, 0.20]
+        return random.choices(["approach", "retreat", "neutral"], weights)[0]
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -160,6 +228,7 @@ def main() -> None:
     landmarker  = mp_vision.PoseLandmarker.create_from_options(options)
     last_ts_ms  = -1
     detector    = GestureDetector()
+    cpu_ai      = CpuAI()
     cam_surf    = None
     action      = None
 
@@ -184,6 +253,7 @@ def main() -> None:
                     winner_text = ""
                     player, cpu = make_fighters()
                     detector.reset()
+                    cpu_ai.reset()
 
         # ── Pose inference ───────────────────────────────────────────────────
         ret, frame = cap.read()
@@ -222,7 +292,7 @@ def main() -> None:
             player.apply_action(action)
             player.tick(cpu,    ARENA_L, ARENA_R)
 
-            cpu_action = run_cpu_ai(cpu, player)
+            cpu_action = cpu_ai.tick(cpu, player)
             cpu.apply_action(cpu_action)
             cpu.tick(player, ARENA_L, ARENA_R)
 
