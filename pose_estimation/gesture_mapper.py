@@ -53,16 +53,21 @@ FIGHT_CROUCH_ANGLE = 120.0  # both knee joint angles below this (degrees) → cr
 FIGHT_JUMP_HOLD = 4         # frames both wrists must stay above ears
 FIGHT_JUMP_COOLDOWN = 0.80  # s
 
-PUNCH_MIN_SPEED = 0.35      # m/s; any punch (3-D world velocity)
-PUNCH_MED_SPEED = 0.70      # m/s; medium punch threshold
-PUNCH_STRONG_SPEED = 1.10   # m/s; strong punch threshold
+# Punch: XZ-plane distance from wrist to same-side shoulder
+PUNCH_EXTEND_SPEED = 0.20   # m/s distance expansion → enter extending phase
+PUNCH_RETRACT_SPEED = 0.15  # m/s distance retraction → trigger at reversal
+PUNCH_MIN_EXT = 0.10        # m extension (peak - start) for weak punch
+PUNCH_MED_EXT = 0.20        # m for medium punch
+PUNCH_STRONG_EXT = 0.32     # m for strong punch
 PUNCH_COOLDOWN = 0.45       # s between punch events
 
-KICK_MIN_SPEED = 0.50       # m/s; any kick (ankle 3-D world velocity)
-KICK_MED_SPEED = 0.90       # m/s
-KICK_STRONG_SPEED = 1.40    # m/s
+# Kick: XZ-plane distance from ankle to hip midpoint
+KICK_EXTEND_SPEED = 0.20    # m/s
+KICK_RETRACT_SPEED = 0.15   # m/s
+KICK_MIN_EXT = 0.12         # m extension for weak kick
+KICK_MED_EXT = 0.25         # m for medium kick
+KICK_STRONG_EXT = 0.40      # m for strong kick
 KICK_COOLDOWN = 0.50        # s between kick events
-KICK_KNEE_RISE = 0.08       # knee must rise by this fraction of frame height above EMA
 
 
 class GestureMapper:
@@ -197,28 +202,32 @@ class GestureMapper:
         self._jump_hold_count = 0
 
 
+def _new_limb_state() -> dict:
+    return {'phase': 'idle', 'start_dist': 0.0, 'peak_dist': 0.0, 'prev_dist': None}
+
+
 class FightingGestureMapper:
     """Maps MediaPipe 3-D pose keypoints to fighting-game button states.
 
-    Returns a dict with bool values for:
-        move_left / move_right  — body lean (held)
-        crouch                  — knee-angle squat (held)
-        jump                    — both wrists above ears (one-shot)
-        weak_punch / med_punch / strong_punch  — wrist speed tiers (one-shot)
-        weak_kick  / med_kick  / strong_kick   — ankle speed tiers (one-shot)
+    Punch/kick detection uses phase tracking on XZ-plane distance:
+      - Wrist to same-side shoulder (XZ) for punches
+      - Ankle to hip midpoint (XZ) for kicks
+    Trigger fires when the limb reverses from extending to retracting.
+    Extension amount (peak_dist - start_dist) determines strength.
 
-    Requires kp_world (17, 3) metric 3-D coords from extract_coco().
+    Output keys: move_left, move_right, crouch, jump,
+                 weak_punch, med_punch, strong_punch,
+                 weak_kick, med_kick, strong_kick
     """
 
     def __init__(self):
         self._prev_time: float | None = None
-        self._prev_wrist = {L_WRIST: None, R_WRIST: None}
-        self._prev_ankle = {L_ANKLE: None, R_ANKLE: None}
+        self._punch_st = {L_WRIST: _new_limb_state(), R_WRIST: _new_limb_state()}
+        self._kick_st  = {L_ANKLE: _new_limb_state(), R_ANKLE: _new_limb_state()}
         self._jump_hold = 0
         self._jump_cooldown = 0.0
         self._punch_cooldown = 0.0
         self._kick_cooldown = 0.0
-        self._knee_y_ema: np.ndarray | None = None  # (left_knee_y, right_knee_y) in norm coords
 
     def compute(self, kp_px: np.ndarray, kp_conf: np.ndarray, kp_world: np.ndarray) -> dict:
         now = time.monotonic()
@@ -277,71 +286,82 @@ class FightingGestureMapper:
                 self._jump_cooldown = now + FIGHT_JUMP_COOLDOWN
                 self._jump_hold = 0
 
-        # ── Punch: max wrist 3-D world speed ──────────────────────────────────
-        if ok(L_WRIST, R_WRIST):
-            speeds = []
-            for idx in (L_WRIST, R_WRIST):
-                prev = self._prev_wrist[idx]
-                cur = kp_world[idx].copy()
-                if prev is not None:
-                    speeds.append(float(np.linalg.norm((cur - prev) / dt)))
-                self._prev_wrist[idx] = cur
-            if speeds and now >= self._punch_cooldown:
-                spd = max(speeds)
-                if spd >= PUNCH_MIN_SPEED:
-                    if spd >= PUNCH_STRONG_SPEED:
-                        out['strong_punch'] = True
-                    elif spd >= PUNCH_MED_SPEED:
-                        out['med_punch'] = True
-                    else:
-                        out['weak_punch'] = True
+        # ── Punch: XZ-plane distance from wrist to same-side shoulder ─────────
+        # Trigger fires when wrist reverses from extending to retracting.
+        for wrist_idx, shoulder_idx in ((L_WRIST, L_SHOULDER), (R_WRIST, R_SHOULDER)):
+            if ok(wrist_idx, shoulder_idx):
+                w = kp_world[wrist_idx]
+                s = kp_world[shoulder_idx]
+                dist = float(np.hypot(w[0] - s[0], w[2] - s[2]))
+                result = self._update_strike(
+                    self._punch_st[wrist_idx], dist, dt,
+                    PUNCH_EXTEND_SPEED, PUNCH_RETRACT_SPEED,
+                    PUNCH_MIN_EXT, PUNCH_MED_EXT, PUNCH_STRONG_EXT,
+                )
+                if result and now >= self._punch_cooldown:
+                    out[result + '_punch'] = True
                     self._punch_cooldown = now + PUNCH_COOLDOWN
-        else:
-            self._prev_wrist[L_WRIST] = None
-            self._prev_wrist[R_WRIST] = None
-
-        # ── Kick: ankle 3-D world speed with knee-raised guard ────────────────
-        if ok(L_KNEE, R_KNEE):
-            kv = np.array([kn[L_KNEE, 1], kn[R_KNEE, 1]])
-            if self._knee_y_ema is None:
-                self._knee_y_ema = kv.copy()
             else:
-                self._knee_y_ema = 0.05 * kv + 0.95 * self._knee_y_ema
-            knee_raised = (kn[L_KNEE, 1] < self._knee_y_ema[0] - KICK_KNEE_RISE or
-                           kn[R_KNEE, 1] < self._knee_y_ema[1] - KICK_KNEE_RISE)
-        else:
-            knee_raised = False
+                self._punch_st[wrist_idx]['prev_dist'] = None
 
-        if ok(L_ANKLE, R_ANKLE):
-            speeds = []
-            for idx in (L_ANKLE, R_ANKLE):
-                prev = self._prev_ankle[idx]
-                cur = kp_world[idx].copy()
-                if prev is not None and knee_raised:
-                    speeds.append(float(np.linalg.norm((cur - prev) / dt)))
-                self._prev_ankle[idx] = cur
-            if speeds and now >= self._kick_cooldown:
-                spd = max(speeds)
-                if spd >= KICK_MIN_SPEED:
-                    if spd >= KICK_STRONG_SPEED:
-                        out['strong_kick'] = True
-                    elif spd >= KICK_MED_SPEED:
-                        out['med_kick'] = True
-                    else:
-                        out['weak_kick'] = True
-                    self._kick_cooldown = now + KICK_COOLDOWN
-        else:
-            self._prev_ankle[L_ANKLE] = None
-            self._prev_ankle[R_ANKLE] = None
+        # ── Kick: XZ-plane distance from ankle to hip midpoint ────────────────
+        if ok(L_HIP, R_HIP):
+            hip_x = (kp_world[L_HIP][0] + kp_world[R_HIP][0]) / 2
+            hip_z = (kp_world[L_HIP][2] + kp_world[R_HIP][2]) / 2
+            for ankle_idx in (L_ANKLE, R_ANKLE):
+                if ok(ankle_idx):
+                    a = kp_world[ankle_idx]
+                    dist = float(np.hypot(a[0] - hip_x, a[2] - hip_z))
+                    result = self._update_strike(
+                        self._kick_st[ankle_idx], dist, dt,
+                        KICK_EXTEND_SPEED, KICK_RETRACT_SPEED,
+                        KICK_MIN_EXT, KICK_MED_EXT, KICK_STRONG_EXT,
+                    )
+                    if result and now >= self._kick_cooldown:
+                        out[result + '_kick'] = True
+                        self._kick_cooldown = now + KICK_COOLDOWN
+                else:
+                    self._kick_st[ankle_idx]['prev_dist'] = None
 
         return out
 
+    @staticmethod
+    def _update_strike(st: dict, dist: float, dt: float,
+                       extend_spd: float, retract_spd: float,
+                       min_ext: float, med_ext: float, strong_ext: float,
+                       ) -> str | None:
+        """Track extending/retracting phase; return strength tier or None."""
+        result = None
+        prev = st['prev_dist']
+        if prev is not None:
+            speed = (dist - prev) / dt  # positive = moving away from body
+            if st['phase'] == 'idle':
+                if speed > extend_spd:
+                    st['phase'] = 'extending'
+                    st['start_dist'] = prev
+                    st['peak_dist'] = dist
+            elif st['phase'] == 'extending':
+                if dist > st['peak_dist']:
+                    st['peak_dist'] = dist
+                if speed < -retract_spd:
+                    ext = st['peak_dist'] - st['start_dist']
+                    if ext >= strong_ext:
+                        result = 'strong'
+                    elif ext >= med_ext:
+                        result = 'med'
+                    elif ext >= min_ext:
+                        result = 'weak'
+                    st['phase'] = 'idle'
+        st['prev_dist'] = dist
+        return result
+
     def reset(self) -> None:
         self._prev_time = None
-        self._prev_wrist = {L_WRIST: None, R_WRIST: None}
-        self._prev_ankle = {L_ANKLE: None, R_ANKLE: None}
+        for s in self._punch_st.values():
+            s.update(_new_limb_state())
+        for s in self._kick_st.values():
+            s.update(_new_limb_state())
         self._jump_hold = 0
         self._jump_cooldown = 0.0
         self._punch_cooldown = 0.0
         self._kick_cooldown = 0.0
-        self._knee_y_ema = None
