@@ -21,7 +21,7 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_tasks
 from mediapipe.tasks.python import vision as mp_vision
 
-from gesture_mapper import GestureMapper
+from gesture_mapper import GestureMapper, FightingGestureMapper
 from pose_sender import PoseSender, build_packet
 
 KEYPOINT_NAMES = [
@@ -49,6 +49,9 @@ MIN_PRESENCE_CONF = 0.5
 MIN_TRACK_CONF = 0.5
 CAMERA_INDEX = 0
 FRAME_W, FRAME_H = 1280, 720
+
+# Set True to drive a fighting game via keyboard instead of sending UDP to Unity.
+FIGHTING_MODE = True
 
 # Model variant: "lite" (fastest) | "full" (balanced) | "heavy" (most accurate).
 MODEL_VARIANT = "full"
@@ -108,6 +111,20 @@ def draw_pose(frame: cv2.Mat, kp_px, confidences) -> None:
             cv2.line(frame, points[a], points[b], (0, 200, 255), 2)
 
 
+_FIGHT_LABEL = {
+    'move_left': 'A', 'move_right': 'D', 'crouch': 'S', 'jump': 'W',
+    'weak_punch': 'I', 'med_punch': 'O', 'strong_punch': 'P',
+    'weak_kick': 'J', 'med_kick': 'K', 'strong_kick': 'L',
+}
+
+
+def draw_fight_state(frame, state: dict) -> None:
+    active = [v for k, v in _FIGHT_LABEL.items() if state.get(k)]
+    text = ' '.join(active) if active else '-'
+    cv2.putText(frame, f"Keys: {text}", (10, 135),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+
 def print_pose_data(kp_px, kp_world, confidences) -> None:
     print("\n--- Pose ---")
     for i, (kp, w3, conf) in enumerate(zip(kp_px, kp_world, confidences)):
@@ -126,7 +143,16 @@ def main() -> None:
 
     model_path = ensure_model()
     print(f"MediaPipe PoseLandmarker ({MODEL_VARIANT}) ready.")
-    print("\nControls: [q] quit  [p] print keypoints  [g] print locomotion features\n")
+    if FIGHTING_MODE:
+        from fighting_keyboard import FightingKeyboardController
+        fight_mapper = FightingGestureMapper()
+        fight_kb = FightingKeyboardController()
+        print("FIGHTING MODE — keyboard output active.")
+        print("Controls: [q] quit  [p] print keypoints  [g] print fight state\n")
+    else:
+        mapper = GestureMapper()
+        sender = PoseSender()
+        print("\nControls: [q] quit  [p] print keypoints  [g] print locomotion features\n")
 
     options = mp_vision.PoseLandmarkerOptions(
         base_options=mp_tasks.BaseOptions(model_asset_path=model_path),
@@ -138,81 +164,94 @@ def main() -> None:
     )
     landmarker = mp_vision.PoseLandmarker.create_from_options(options)
 
-    mapper = GestureMapper()
-    sender = PoseSender()
-
     prev_time = time.perf_counter()
     last_ts_ms = -1
     print_next = False
     print_gesture = False
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
 
-        # MediaPipe expects an RGB mp.Image; OpenCV gives BGR.
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            # MediaPipe expects an RGB mp.Image; OpenCV gives BGR.
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        # VIDEO mode needs a strictly increasing timestamp in ms.
-        ts_ms = max(last_ts_ms + 1, int(time.perf_counter() * 1000))
-        last_ts_ms = ts_ms
-        result = landmarker.detect_for_video(mp_image, ts_ms)
+            # VIDEO mode needs a strictly increasing timestamp in ms.
+            ts_ms = max(last_ts_ms + 1, int(time.perf_counter() * 1000))
+            last_ts_ms = ts_ms
+            result = landmarker.detect_for_video(mp_image, ts_ms)
 
-        h, w = frame.shape[:2]
-        detected = bool(result.pose_landmarks) and bool(result.pose_world_landmarks)
+            h, w = frame.shape[:2]
+            detected = bool(result.pose_landmarks) and bool(result.pose_world_landmarks)
 
-        if detected:
-            kp_norm, kp_conf, kp_world = extract_coco(
-                result.pose_landmarks[0],
-                result.pose_world_landmarks[0],
-            )
+            if detected:
+                kp_norm, kp_conf, kp_world = extract_coco(
+                    result.pose_landmarks[0],
+                    result.pose_world_landmarks[0],
+                )
 
-            kp_px = kp_norm.copy()
-            kp_px[:, 0] *= w
-            kp_px[:, 1] *= h
+                kp_px = kp_norm.copy()
+                kp_px[:, 0] *= w
+                kp_px[:, 1] *= h
 
-            draw_pose(frame, kp_px, kp_conf)
-            if print_next:
-                print_pose_data(kp_px, kp_world, kp_conf)
+                draw_pose(frame, kp_px, kp_conf)
+                if print_next:
+                    print_pose_data(kp_px, kp_world, kp_conf)
 
-            features = mapper.compute(kp_px, kp_conf)
-            sender.send(build_packet(kp_norm, kp_conf, kp_world, features))
-            if print_gesture:
-                print(f"Features: {features}")
-        else:
-            sender.send_neutral()
-            mapper.reset()
+                if FIGHTING_MODE:
+                    fight_state = fight_mapper.compute(kp_px, kp_conf, kp_world)
+                    fight_kb.update(fight_state)
+                    draw_fight_state(frame, fight_state)
+                    if print_gesture:
+                        print(f"Fight state: {fight_state}")
+                else:
+                    features = mapper.compute(kp_px, kp_conf)
+                    sender.send(build_packet(kp_norm, kp_conf, kp_world, features))
+                    if print_gesture:
+                        print(f"Features: {features}")
+            else:
+                if FIGHTING_MODE:
+                    fight_mapper.reset()
+                    fight_kb.release_all()
+                else:
+                    sender.send_neutral()
+                    mapper.reset()
 
-        print_next = False
-        print_gesture = False
+            print_next = False
+            print_gesture = False
 
-        now = time.perf_counter()
-        fps = 1.0 / (now - prev_time)
-        prev_time = now
+            now = time.perf_counter()
+            fps = 1.0 / (now - prev_time)
+            prev_time = now
 
-        cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        cv2.putText(frame, f"Detected: {'yes' if detected else 'no'}", (10, 65),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-        cv2.putText(frame, f"MediaPipe 3D ({MODEL_VARIANT})", (10, 100),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            cv2.putText(frame, f"Detected: {'yes' if detected else 'no'}", (10, 65),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            mode_label = "FIGHTING" if FIGHTING_MODE else f"MediaPipe 3D ({MODEL_VARIANT})"
+            cv2.putText(frame, mode_label, (10, 100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
 
-        cv2.imshow("Pose Estimation (MediaPipe 3D)", frame)
+            cv2.imshow("Pose Estimation (MediaPipe 3D)", frame)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            break
-        elif key == ord("p"):
-            print_next = True
-        elif key == ord("g"):
-            print_gesture = True
-
-    cap.release()
-    cv2.destroyAllWindows()
-    landmarker.close()
-    sender.close()
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            elif key == ord("p"):
+                print_next = True
+            elif key == ord("g"):
+                print_gesture = True
+    finally:
+        if FIGHTING_MODE:
+            fight_kb.release_all()
+        cap.release()
+        cv2.destroyAllWindows()
+        landmarker.close()
+        if not FIGHTING_MODE:
+            sender.close()
 
 
 if __name__ == "__main__":
