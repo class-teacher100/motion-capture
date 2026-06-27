@@ -206,6 +206,41 @@ def _new_limb_state() -> dict:
     return {'phase': 'idle', 'start_dist': 0.0, 'peak_dist': 0.0, 'prev_dist': None}
 
 
+def _update_strike(st: dict, dist: float, dt: float,
+                   extend_spd: float, retract_spd: float,
+                   min_ext: float, med_ext: float, strong_ext: float,
+                   ) -> str | None:
+    """Track extending/retracting phase; return 'weak'/'med'/'strong' or None.
+
+    Works on any scalar distance regardless of coordinate space or units —
+    used by both FightingGestureMapper (3-D metres) and
+    FightingGestureMapper2D (normalised pixel coords).
+    """
+    result = None
+    prev = st['prev_dist']
+    if prev is not None:
+        speed = (dist - prev) / dt          # positive = extending away from body
+        if st['phase'] == 'idle':
+            if speed > extend_spd:
+                st['phase'] = 'extending'
+                st['start_dist'] = prev
+                st['peak_dist'] = dist
+        elif st['phase'] == 'extending':
+            if dist > st['peak_dist']:
+                st['peak_dist'] = dist
+            if speed < -retract_spd:
+                ext = st['peak_dist'] - st['start_dist']
+                if ext >= strong_ext:
+                    result = 'strong'
+                elif ext >= med_ext:
+                    result = 'med'
+                elif ext >= min_ext:
+                    result = 'weak'
+                st['phase'] = 'idle'
+    st['prev_dist'] = dist
+    return result
+
+
 class FightingGestureMapper:
     """Maps MediaPipe 3-D pose keypoints to fighting-game button states.
 
@@ -293,7 +328,7 @@ class FightingGestureMapper:
                 w = kp_world[wrist_idx]
                 s = kp_world[shoulder_idx]
                 dist = float(np.hypot(w[0] - s[0], w[2] - s[2]))
-                result = self._update_strike(
+                result = _update_strike(
                     self._punch_st[wrist_idx], dist, dt,
                     PUNCH_EXTEND_SPEED, PUNCH_RETRACT_SPEED,
                     PUNCH_MIN_EXT, PUNCH_MED_EXT, PUNCH_STRONG_EXT,
@@ -312,7 +347,7 @@ class FightingGestureMapper:
                 if ok(ankle_idx):
                     a = kp_world[ankle_idx]
                     dist = float(np.hypot(a[0] - hip_x, a[2] - hip_z))
-                    result = self._update_strike(
+                    result = _update_strike(
                         self._kick_st[ankle_idx], dist, dt,
                         KICK_EXTEND_SPEED, KICK_RETRACT_SPEED,
                         KICK_MIN_EXT, KICK_MED_EXT, KICK_STRONG_EXT,
@@ -325,35 +360,148 @@ class FightingGestureMapper:
 
         return out
 
-    @staticmethod
-    def _update_strike(st: dict, dist: float, dt: float,
-                       extend_spd: float, retract_spd: float,
-                       min_ext: float, med_ext: float, strong_ext: float,
-                       ) -> str | None:
-        """Track extending/retracting phase; return strength tier or None."""
-        result = None
-        prev = st['prev_dist']
-        if prev is not None:
-            speed = (dist - prev) / dt  # positive = moving away from body
-            if st['phase'] == 'idle':
-                if speed > extend_spd:
-                    st['phase'] = 'extending'
-                    st['start_dist'] = prev
-                    st['peak_dist'] = dist
-            elif st['phase'] == 'extending':
-                if dist > st['peak_dist']:
-                    st['peak_dist'] = dist
-                if speed < -retract_spd:
-                    ext = st['peak_dist'] - st['start_dist']
-                    if ext >= strong_ext:
-                        result = 'strong'
-                    elif ext >= med_ext:
-                        result = 'med'
-                    elif ext >= min_ext:
-                        result = 'weak'
-                    st['phase'] = 'idle'
-        st['prev_dist'] = dist
-        return result
+    def reset(self) -> None:
+        self._prev_time = None
+        for s in self._punch_st.values():
+            s.update(_new_limb_state())
+        for s in self._kick_st.values():
+            s.update(_new_limb_state())
+        self._jump_hold = 0
+        self._jump_cooldown = 0.0
+        self._punch_cooldown = 0.0
+        self._kick_cooldown = 0.0
+
+
+# --- 2-D fighting game thresholds (normalised pixel coords 0-1) -----------
+# Distances are frame-size normalised: 0.10 ≈ 128 px at 1280 wide.
+# Best results when punch/kick motion is perpendicular to the camera axis
+# (side punches, roundhouse kicks); forward punches toward the camera are
+# largely invisible in the image plane.
+PUNCH_2D_EXTEND_SPEED = 0.30   # norm/s; extension speed to enter extending phase
+PUNCH_2D_RETRACT_SPEED = 0.20  # norm/s; retraction speed to trigger
+PUNCH_2D_MIN_EXT = 0.07        # norm; extension (peak-start) for weak punch
+PUNCH_2D_MED_EXT = 0.13        # norm; medium punch
+PUNCH_2D_STRONG_EXT = 0.21     # norm; strong punch
+PUNCH_2D_COOLDOWN = 0.45       # s
+
+KICK_2D_EXTEND_SPEED = 0.30
+KICK_2D_RETRACT_SPEED = 0.20
+KICK_2D_MIN_EXT = 0.08
+KICK_2D_MED_EXT = 0.15
+KICK_2D_STRONG_EXT = 0.24
+KICK_2D_COOLDOWN = 0.50
+
+
+class FightingGestureMapper2D:
+    """2-D variant of FightingGestureMapper — uses only normalised pixel coords.
+
+    Punch: 2-D Euclidean distance from wrist to same-side shoulder.
+    Kick : 2-D Euclidean distance from ankle to hip midpoint.
+    Move/crouch/jump: identical to the 3-D version (already pixel-based).
+
+    Takes kp_px (17, 2) pixel coords and kp_conf (17,) — no kp_world needed.
+    Compatible with any 2-D pose estimator that outputs COCO-17 keypoints
+    (YOLO-pose, MediaPipe 2-D, etc.).
+    """
+
+    def __init__(self):
+        self._prev_time: float | None = None
+        self._punch_st = {L_WRIST: _new_limb_state(), R_WRIST: _new_limb_state()}
+        self._kick_st  = {L_ANKLE: _new_limb_state(), R_ANKLE: _new_limb_state()}
+        self._jump_hold = 0
+        self._jump_cooldown = 0.0
+        self._punch_cooldown = 0.0
+        self._kick_cooldown = 0.0
+
+    def compute(self, kp_px: np.ndarray, kp_conf: np.ndarray) -> dict:
+        now = time.monotonic()
+        dt = (now - self._prev_time) if self._prev_time is not None else 1 / 30.0
+        self._prev_time = now
+        dt = max(dt, 1e-3)
+
+        out = dict(
+            move_left=False, move_right=False,
+            crouch=False, jump=False,
+            weak_punch=False, med_punch=False, strong_punch=False,
+            weak_kick=False, med_kick=False, strong_kick=False,
+        )
+
+        def ok(*idx):
+            return all(kp_conf[i] >= KP_MIN_CONF for i in idx)
+
+        kn = kp_px.astype(float).copy()
+        kn[:, 0] /= FRAME_W
+        kn[:, 1] /= FRAME_H
+
+        # ── Move left / right ─────────────────────────────────────────────────
+        if ok(L_SHOULDER, R_SHOULDER, L_HIP, R_HIP):
+            sh_x = (kn[L_SHOULDER, 0] + kn[R_SHOULDER, 0]) / 2
+            hi_x = (kn[L_HIP, 0] + kn[R_HIP, 0]) / 2
+            sh_y = (kn[L_SHOULDER, 1] + kn[R_SHOULDER, 1]) / 2
+            hi_y = (kn[L_HIP, 1] + kn[R_HIP, 1]) / 2
+            torso_h = abs(hi_y - sh_y)
+            if torso_h > 0.01:
+                offset = (sh_x - hi_x) / torso_h
+                if offset > FIGHT_LEAN_DEADZONE:
+                    out['move_right'] = True
+                elif offset < -FIGHT_LEAN_DEADZONE:
+                    out['move_left'] = True
+
+        # ── Crouch ────────────────────────────────────────────────────────────
+        if ok(L_HIP, L_KNEE, L_ANKLE, R_HIP, R_KNEE, R_ANKLE):
+            def _angle(a, v, b):
+                u = kn[a] - kn[v]
+                w = kn[b] - kn[v]
+                cos = np.dot(u, w) / (np.linalg.norm(u) * np.linalg.norm(w) + 1e-9)
+                return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+            if (_angle(L_HIP, L_KNEE, L_ANKLE) < FIGHT_CROUCH_ANGLE and
+                    _angle(R_HIP, R_KNEE, R_ANKLE) < FIGHT_CROUCH_ANGLE):
+                out['crouch'] = True
+
+        # ── Jump ──────────────────────────────────────────────────────────────
+        if ok(L_WRIST, R_WRIST, L_EAR, R_EAR):
+            if kn[L_WRIST, 1] < kn[L_EAR, 1] and kn[R_WRIST, 1] < kn[R_EAR, 1]:
+                self._jump_hold += 1
+            else:
+                self._jump_hold = 0
+            if self._jump_hold >= FIGHT_JUMP_HOLD and now >= self._jump_cooldown:
+                out['jump'] = True
+                self._jump_cooldown = now + FIGHT_JUMP_COOLDOWN
+                self._jump_hold = 0
+
+        # ── Punch: 2-D distance from wrist to same-side shoulder ──────────────
+        for wrist_idx, shoulder_idx in ((L_WRIST, L_SHOULDER), (R_WRIST, R_SHOULDER)):
+            if ok(wrist_idx, shoulder_idx):
+                dist = float(np.linalg.norm(kn[wrist_idx] - kn[shoulder_idx]))
+                result = _update_strike(
+                    self._punch_st[wrist_idx], dist, dt,
+                    PUNCH_2D_EXTEND_SPEED, PUNCH_2D_RETRACT_SPEED,
+                    PUNCH_2D_MIN_EXT, PUNCH_2D_MED_EXT, PUNCH_2D_STRONG_EXT,
+                )
+                if result and now >= self._punch_cooldown:
+                    out[result + '_punch'] = True
+                    self._punch_cooldown = now + PUNCH_2D_COOLDOWN
+            else:
+                self._punch_st[wrist_idx]['prev_dist'] = None
+
+        # ── Kick: 2-D distance from ankle to hip midpoint ─────────────────────
+        if ok(L_HIP, R_HIP):
+            hip = (kn[L_HIP] + kn[R_HIP]) / 2
+            for ankle_idx in (L_ANKLE, R_ANKLE):
+                if ok(ankle_idx):
+                    dist = float(np.linalg.norm(kn[ankle_idx] - hip))
+                    result = _update_strike(
+                        self._kick_st[ankle_idx], dist, dt,
+                        KICK_2D_EXTEND_SPEED, KICK_2D_RETRACT_SPEED,
+                        KICK_2D_MIN_EXT, KICK_2D_MED_EXT, KICK_2D_STRONG_EXT,
+                    )
+                    if result and now >= self._kick_cooldown:
+                        out[result + '_kick'] = True
+                        self._kick_cooldown = now + KICK_2D_COOLDOWN
+                else:
+                    self._kick_st[ankle_idx]['prev_dist'] = None
+
+        return out
 
     def reset(self) -> None:
         self._prev_time = None
