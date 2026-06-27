@@ -122,7 +122,7 @@ def draw_fight_state(frame, state: dict) -> None:
     active = [v for k, v in _FIGHT_LABEL.items() if state.get(k)]
     text = ' '.join(active) if active else '-'
     cv2.putText(frame, f"Keys: {text}", (10, 135),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 0), 2)
 
 
 def print_pose_data(kp_px, kp_world, confidences) -> None:
@@ -147,8 +147,9 @@ def main() -> None:
         from fighting_keyboard import FightingKeyboardController
         fight_mapper = FightingGestureMapper()
         fight_kb = FightingKeyboardController()
+        fight_paused = False
         print("FIGHTING MODE — keyboard output active.")
-        print("Controls: [q] quit  [p] print keypoints  [g] print fight state\n")
+        print("Controls: [q] quit  [p] print keypoints  [g] print fight state  [space] pause\n")
     else:
         mapper = GestureMapper()
         sender = PoseSender()
@@ -203,7 +204,8 @@ def main() -> None:
 
                 if FIGHTING_MODE:
                     fight_state = fight_mapper.compute(kp_px, kp_conf, kp_world)
-                    fight_kb.update(fight_state)
+                    if not fight_paused:
+                        fight_kb.update(fight_state)
                     draw_fight_state(frame, fight_state)
                     if print_gesture:
                         print(f"Fight state: {fight_state}")
@@ -231,9 +233,17 @@ def main() -> None:
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
             cv2.putText(frame, f"Detected: {'yes' if detected else 'no'}", (10, 65),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            mode_label = "FIGHTING" if FIGHTING_MODE else f"MediaPipe 3D ({MODEL_VARIANT})"
+            if FIGHTING_MODE and fight_paused:
+                mode_label = "FIGHTING [PAUSED]"
+                mode_color = (100, 100, 100)
+            elif FIGHTING_MODE:
+                mode_label = "FIGHTING"
+                mode_color = (200, 200, 200)
+            else:
+                mode_label = f"MediaPipe 3D ({MODEL_VARIANT})"
+                mode_color = (200, 200, 200)
             cv2.putText(frame, mode_label, (10, 100),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, mode_color, 1)
 
             cv2.imshow("Pose Estimation (MediaPipe 3D)", frame)
 
@@ -244,6 +254,10 @@ def main() -> None:
                 print_next = True
             elif key == ord("g"):
                 print_gesture = True
+            elif key == ord(" ") and FIGHTING_MODE:
+                fight_paused = not fight_paused
+                fight_kb.release_all()
+                print(f"Fighting keyboard {'PAUSED' if fight_paused else 'RESUMED'}")
     finally:
         if FIGHTING_MODE:
             fight_kb.release_all()
